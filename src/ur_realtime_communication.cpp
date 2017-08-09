@@ -98,12 +98,7 @@ void UrRealtimeCommunication::addCommandToQueue(std::string inp) {
 void UrRealtimeCommunication::setSpeed(double q0, double q1, double q2,
 		double q3, double q4, double q5, double acc) {
 	char cmd[1024];
-	if( robot_state_->getVersion() >= 3.3 ) {
-		sprintf(cmd,
-				"speedj([%1.5f, %1.5f, %1.5f, %1.5f, %1.5f, %1.5f], %f, 0.008)\n",
-				q0, q1, q2, q3, q4, q5, acc);
-	}
-	else if( robot_state_->getVersion() >= 3.1 ) {
+	if( robot_state_->getVersion() >= 3.1 ) {
 		sprintf(cmd,
 				"speedj([%1.5f, %1.5f, %1.5f, %1.5f, %1.5f, %1.5f], %f)\n",
 				q0, q1, q2, q3, q4, q5, acc);
@@ -123,71 +118,86 @@ void UrRealtimeCommunication::setSpeed(double q0, double q1, double q2,
 void UrRealtimeCommunication::run() {
 	uint8_t buf[2048];
 	int bytes_read;
+  int test_bread;
+  int max_reconnection_attempts;
 	bzero(buf, 2048);
 	struct timeval timeout;
 	fd_set readfds;
+  fd_set writefds;
 	FD_ZERO(&readfds);
 	FD_SET(sockfd_, &readfds);
 	print_debug("Realtime port: Got connection");
 	connected_ = true;
+  test_bread = 0;
+  max_reconnection_attempts = 50;
+
 	while (keepalive_) {
 		while (connected_ && keepalive_) {
 			timeout.tv_sec = 0; //do this each loop as selects modifies timeout
 			timeout.tv_usec = 500000; // timeout of 0.5 sec
 			select(sockfd_ + 1, &readfds, NULL, NULL, &timeout);
-			bytes_read = read(sockfd_, buf, 2048);
-			if (bytes_read > 0) {
-				setsockopt(sockfd_, IPPROTO_TCP, TCP_QUICKACK, (char *) &flag_, 
-						sizeof(int));
-				robot_state_->unpack(buf);
-				if (safety_count_ == safety_count_max_) {
-					setSpeed(0., 0., 0., 0., 0., 0.);
-				}
-				safety_count_ += 1;
-			} else {
-				connected_ = false;
-				close(sockfd_);
-			}
-		}
-		if (keepalive_) {
-			//reconnect
-			print_warning("Realtime port: No connection. Is controller crashed? Will try to reconnect in 10 seconds...");
-			sockfd_ = socket(AF_INET, SOCK_STREAM, 0);
-			if (sockfd_ < 0) {
-				print_fatal("ERROR opening socket");
-			}
-			flag_ = 1;
-			setsockopt(sockfd_, IPPROTO_TCP, TCP_NODELAY, (char *) &flag_,
-					sizeof(int));
-			setsockopt(sockfd_, IPPROTO_TCP, TCP_QUICKACK, (char *) &flag_, 
-					sizeof(int));
-	
-			setsockopt(sockfd_, SOL_SOCKET, SO_REUSEADDR, (char *) &flag_,
-					sizeof(int));
-			fcntl(sockfd_, F_SETFL, O_NONBLOCK);
-			while (keepalive_ && !connected_) {
-				std::this_thread::sleep_for(std::chrono::seconds(10));
-				fd_set writefds;
+      test_bread = 0;
+      bytes_read = read(sockfd_, buf, 2048);
+      if (bytes_read <= 0) {
+        connected_ = false;
+        while (!connected_){
+          // reset the socket
+          if (test_bread > max_reconnection_attempts) {
+            test_bread = 0;
+            print_fatal("Coudln't reconnect to the socket...");
+            break;
+          }
+          print_warning("Realtime port - try to reset the socket...");
+          bzero((char *) &serv_addr_, sizeof(serv_addr_));
+          sockfd_ = socket(AF_INET, SOCK_STREAM, 0);
+          if (sockfd_ < 0) {
+            print_fatal("ERROR opening socket");
+          }
+          serv_addr_.sin_family = AF_INET;
+          bcopy((char *) server_->h_addr, (char *)&serv_addr_.sin_addr.s_addr, server_->h_length);
+          serv_addr_.sin_port = htons(30003);
+          flag_ = 1;
+          setsockopt(sockfd_, IPPROTO_TCP, TCP_NODELAY, (char *) &flag_, sizeof(int));
+          setsockopt(sockfd_, IPPROTO_TCP, TCP_QUICKACK, (char *) &flag_, sizeof(int));
+          setsockopt(sockfd_, SOL_SOCKET, SO_REUSEADDR, (char *) &flag_, sizeof(int));
+          fcntl(sockfd_, F_SETFL, O_NONBLOCK);
 
-				connect(sockfd_, (struct sockaddr *) &serv_addr_,
-						sizeof(serv_addr_));
-				FD_ZERO(&writefds);
-				FD_SET(sockfd_, &writefds);
-				select(sockfd_ + 1, NULL, &writefds, NULL, NULL);
-				unsigned int flag_len;
-				getsockopt(sockfd_, SOL_SOCKET, SO_ERROR, &flag_, &flag_len);
-				if (flag_ < 0) {
-					print_error("Error re-connecting to RT port 30003. Is controller started? Will try to reconnect in 10 seconds...");
-				} else {
-					connected_ = true;
-					print_info("Realtime port: Reconnected");
-				}
-			}
-		}
+          connect(sockfd_, (struct sockaddr *) &serv_addr_, sizeof(serv_addr_));
+          FD_ZERO(&writefds);
+          FD_SET(sockfd_, &writefds);
+          timeout.tv_sec = 10;
+          timeout.tv_usec = 0;
+          select(sockfd_ + 1, NULL, &writefds, NULL, &timeout);
+          unsigned int flag_len;
+          getsockopt(sockfd_, SOL_SOCKET, SO_ERROR, &flag_, &flag_len);
+          if (flag_ < 0) {
+            print_fatal("Error connecting to RT port 30003");
+          }
+          // read the buffer back
+          FD_ZERO(&readfds);
+          FD_SET(sockfd_, &readfds);
+          select(sockfd_ + 1, &readfds, NULL, NULL, &timeout);
+          bytes_read = read(sockfd_, buf, 2048);
+          if (bytes_read >0) {
+            connected_ = true;
+          } else {
+            test_bread += 1;
+          }
+        }
+        test_bread= 0;
+      }
+      setsockopt(sockfd_, IPPROTO_TCP, TCP_QUICKACK, (char *) &flag_,sizeof(int));
+      robot_state_->unpack(buf);
+      if (safety_count_ == safety_count_max_) {
+        setSpeed(0., 0., 0., 0., 0., 0.);
+      }
+      safety_count_ += 1;
 	}
-	setSpeed(0., 0., 0., 0., 0., 0.);
-	close(sockfd_);
+setSpeed(0., 0., 0., 0., 0., 0.);
+close(sockfd_);
 }
+}
+
 
 void UrRealtimeCommunication::setSafetyCountMax(uint inp) {
 	safety_count_max_ = inp;
